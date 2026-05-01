@@ -1,0 +1,52 @@
+name: Weekly Client Utilization Report
+
+on:
+  schedule:
+    # Runs every Monday at 13:00 UTC
+    # = 8:00 AM Central Daylight Time (Mar-Nov)
+    # = 7:00 AM Central Standard Time (Nov-Mar)
+    # GitHub Actions cron is UTC-only and does not auto-adjust for DST.
+    - cron: '0 13 * * 1'
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+permissions:
+  contents: write  # required to commit reports back to the repo
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate report and post to Slack
+        env:
+          CLOCKIFY_API_KEY: ${{ secrets.CLOCKIFY_API_KEY }}
+          CLOCKIFY_WORKSPACE_ID: ${{ secrets.CLOCKIFY_WORKSPACE_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          python client_utilization_report.py --week previous --output-dir ./reports
+
+      - name: Commit and push report
+        run: |
+          git config user.name "Tiderise Routines"
+          git config user.email "routines@tiderise.io"
+          git add reports/
+          if git diff --staged --quiet; then
+            echo "No new report to commit"
+          else
+            git commit -m "Weekly utilization report - $(date -u +%Y-%m-%d)"
+            git push
+          fi
