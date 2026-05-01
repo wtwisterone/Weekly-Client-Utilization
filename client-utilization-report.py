@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+Tiderise Weekly Client Utilization Report Generator
+Reads the most recent Clockify Assignments export and produces an HTML dashboard.
+Scheduled to run Monday mornings.
+"""
+
+import pandas as pd
+import glob
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+
+SANDBOX = os.path.dirname(os.path.abspath(__file__))
+INTERNAL_CLIENT = "Tiderise MW"
+
+# ── Find most recent Clockify Assignments file ──────────────────────────────
+def find_latest_assignments():
+    pattern = os.path.join(SANDBOX, "Clockify_Assignments_*.xlsx")
+    files = glob.glob(pattern)
+    if not files:
+        raise FileNotFoundError(f"No Clockify_Assignments_*.xlsx files found in {SANDBOX}")
+    # Extract date range from filename and sort
+    def extract_end_date(f):
+        m = re.search(r'Clockify_Assignments_(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})', os.path.basename(f))
+        if m:
+            return datetime.strptime(m.group(2), "%m_%d_%Y")
+        return datetime.min
+    files.sort(key=extract_end_date, reverse=True)
+    return files[0]
+
+# ── Parse data ───────────────────────────────────────────────────────────────
+def parse_assignments(filepath):
+    df = pd.read_excel(filepath)
+    # Remove the Total row
+    df = df[~df['Project'].str.startswith('Total', na=False)].copy()
+    # Split "Project Name - Client Name"
+    splits = df['Project'].str.rsplit(' - ', n=1, expand=True)
+    df['ProjectName'] = splits[0].str.strip()
+    df['Client'] = splits[1].str.strip() if 1 in splits.columns else 'Unknown'
+    # Extract date range from filename
+    basename = os.path.basename(filepath)
+    m = re.search(r'Clockify_Assignments_(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})', basename)
+    start_date = datetime.strptime(m.group(1), "%m_%d_%Y") if m else None
+    end_date = datetime.strptime(m.group(2), "%m_%d_%Y") if m else None
+    return df, start_date, end_date
+
+# ── Build report data ────────────────────────────────────────────────────────
+def build_report(df):
+    # Filter to external clients only
+    client_df = df[df['Client'] != INTERNAL_CLIENT].copy()
+
+    # Client-level aggregation
+    client_summary = client_df.groupby('Client').agg(
+        Scheduled=('Scheduled', 'sum'),
+        Tracked=('Tracked', 'sum')
+    ).reset_index()
+    client_summary['Utilization'] = client_summary.apply(
+        lambda r: (r['Tracked'] / r['Scheduled'] * 100) if r['Scheduled'] > 0 else None, axis=1
+    )
+    client_summary['Difference'] = client_summary['Tracked'] - client_summary['Scheduled']
+    client_summary.sort_values('Tracked', ascending=False, inplace=True)
+
+    # Project-level detail (under each client)
+    project_detail = client_df.groupby(['Client', 'ProjectName']).agg(
+        Scheduled=('Scheduled', 'sum'),
+        Tracked=('Tracked', 'sum')
+    ).reset_index()
+    project_detail['Utilization'] = project_detail.apply(
+        lambda r: (r['Tracked'] / r['Scheduled'] * 100) if r['Scheduled'] > 0 else None, axis=1
+    )
+
+    # KPIs
+    total_scheduled = client_summary['Scheduled'].sum()
+    total_tracked = client_summary['Tracked'].sum()
+    overall_util = (total_tracked / total_scheduled * 100) if total_scheduled > 0 else 0
+    num_clients = len(client_summary)
+
+    healthy = len(client_summary[client_summary['Utilization'] >= 80])
+    attention = len(client_summary[(client_summary['Utilization'] >= 65) & (client_summary['Utilization'] < 80)])
+    at_risk = len(client_summary[(client_summary['Utilization'].notna()) & (client_summary['Utilization'] < 65)])
+    zero_tracked = len(client_summary[client_summary['Tracked'] == 0])
+    unscheduled = len(client_summary[client_summary['Scheduled'] == 0])
+
+    return {
+        'client_summary': client_summary,
+        'project_detail': project_detail,
+        'total_scheduled': total_scheduled,
+        'total_tracked': total_tracked,
+        'overall_util': overall_util,
+        'num_clients': num_clients,
+        'healthy': healthy,
+        'attention': attention,
+        'at_risk': at_risk,
+        'zero_tracked': zero_tracked,
+        'unscheduled': unscheduled,
+    }
+
+# ── Status helpers ───────────────────────────────────────────────────────────
+def get_status(util, scheduled, tracked):
+    if scheduled == 0 and tracked > 0:
+        return ('Unscheduled', '#6366f1')
+    if tracked == 0 and scheduled > 0:
+        return ('Zero Tracked', '#64748b')
+    if util is None:
+        return ('—', '#64748b')
+    if util >= 80:
+        return ('Healthy', '#10b981')
+    if util >= 65:
+        return ('Needs Attention', '#f59e0b')
+    return ('At Risk', '#ef4444')
+
+def status_badge(label, color):
+    return f'<span style="background:{color}22;color:{color};padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap">{label}</span>'
+
+def util_color(util):
+    if util is None:
+        return '#64748b'
+    if util >= 80:
+        return '#10b981'
+    if util >= 65:
+        return '#f59e0b'
+    return '#ef4444'
+
+# ── Gauge SVG ────────────────────────────────────────────────────────────────
+def gauge_svg(value, label, max_val=100):
+    import math
+    pct = min(max(value / max_val, 0), 1)
+    # Gauge arc from 180° (left) to 0° (right)
+    cx, cy, r = 100, 110, 70
+    def point(angle):
+        rad = math.radians(angle)
+        return cx + r * math.cos(rad), cy - r * math.sin(rad)
+
+    # Three arc segments: red (0-65%), amber (65-80%), green (80-100%)
+    def arc_path(start_pct, end_pct, color):
+        a1 = 180 - start_pct * 180
+        a2 = 180 - end_pct * 180
+        x1, y1 = point(a1)
+        x2, y2 = point(a2)
+        large = 1 if (a1 - a2) > 180 else 0
+        return f'<path d="M {x1:.2f} {y1:.2f} A {r} {r} 0 {large} 1 {x2:.2f} {y2:.2f}" stroke="{color}" stroke-width="10" fill="none" stroke-linecap="round" opacity="0.3"/>'
+
+    # Needle
+    needle_angle = 180 - pct * 180
+    nx, ny = point(needle_angle)
+    nx = cx + (r - 10) * math.cos(math.radians(needle_angle))
+    ny = cy - (r - 10) * math.sin(math.radians(needle_angle))
+
+    needle_color = util_color(value)
+
+    arcs = arc_path(0, 0.65, '#ef4444') + arc_path(0.65, 0.80, '#f59e0b') + arc_path(0.80, 1.0, '#10b981')
+
+    return f'''<svg viewBox="0 0 200 140" style="width:180px;height:126px">
+        {arcs}
+        <line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="{needle_color}" stroke-width="3" stroke-linecap="round"/>
+        <circle cx="{cx}" cy="{cy}" r="6" fill="{needle_color}"/>
+        <text x="{cx}" y="100" text-anchor="middle" fill="#e2e8f0" font-size="22" font-weight="700">{value:.1f}%</text>
+    </svg>'''
+
+# ── Generate HTML ────────────────────────────────────────────────────────────
+def generate_html(data, start_date, end_date):
+    cs = data['client_summary']
+    pd_detail = data['project_detail']
+
+    start_str = start_date.strftime('%b %d') if start_date else '?'
+    end_str = end_date.strftime('%b %d, %Y') if end_date else '?'
+    date_range = f"{start_str} – {end_str}"
+    gen_time = datetime.now().strftime('%b %d, %Y %I:%M %p')
+
+    # ── KPI Cards ──
+    kpi_cards = f'''
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px">
+      <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Overall Utilization</div>
+        <div style="color:#e2e8f0;font-size:32px;font-weight:700;line-height:1">{data["overall_util"]:.1f}%</div>
+        <div style="color:#64748b;font-size:13px;margin-top:8px"><span style="color:{util_color(data["overall_util"])};font-weight:600">{get_status(data["overall_util"], 1, 1)[0]}</span></div>
+      </div>
+      <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Client Hours Tracked</div>
+        <div style="color:#e2e8f0;font-size:32px;font-weight:700;line-height:1">{data["total_tracked"]:.0f}h</div>
+        <div style="color:#64748b;font-size:13px;margin-top:8px">of {data["total_scheduled"]:.0f}h scheduled</div>
+      </div>
+      <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Active Clients</div>
+        <div style="color:#e2e8f0;font-size:32px;font-weight:700;line-height:1">{data["num_clients"]}</div>
+        <div style="color:#64748b;font-size:13px;margin-top:8px">{len(cs[cs['Tracked'] > 0])} with tracked hours</div>
+      </div>
+      <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Variance</div>
+        <div style="color:#e2e8f0;font-size:32px;font-weight:700;line-height:1">{data["total_tracked"] - data["total_scheduled"]:+.0f}h</div>
+        <div style="color:#64748b;font-size:13px;margin-top:8px">tracked vs. scheduled delta</div>
+      </div>
+    </div>'''
+
+    # ── Gauges ──
+    gauges = f'''
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px">
+      <div style="background:#1a1d27;border-radius:16px;padding:20px;text-align:center;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">Overall Client Utilization</div>
+        {gauge_svg(data["overall_util"], "Overall")}
+      </div>
+      <div style="background:#1a1d27;border-radius:16px;padding:20px;text-align:center;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">Healthy Client Rate</div>
+        {gauge_svg((data["healthy"] / max(data["num_clients"],1)) * 100, "Healthy Rate")}
+      </div>
+      <div style="background:#1a1d27;border-radius:16px;padding:20px;text-align:center;border:1px solid #2a2d3a">
+        <div style="color:#94a3b8;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">Schedule Coverage</div>
+        {gauge_svg(min((data["total_tracked"] / max(data["total_scheduled"],1)) * 100, 100), "Coverage")}
+      </div>
+    </div>'''
+
+    # ── Health Summary Cards ──
+    health_cards = f'''
+    <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+      <div style="color:#e2e8f0;font-size:16px;font-weight:700;margin-bottom:16px;text-transform:uppercase;letter-spacing:0.5px">Client Health Summary</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">
+        <div style="background:#1a1d27;border-radius:12px;padding:18px;text-align:center;border:1px solid #2a2d3a;border-left:4px solid #10b981">
+          <div style="color:#10b981;font-size:32px;font-weight:700">{data["healthy"]}</div>
+          <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-top:4px;font-weight:600">Healthy (&ge;80%)</div>
+        </div>
+        <div style="background:#1a1d27;border-radius:12px;padding:18px;text-align:center;border:1px solid #2a2d3a;border-left:4px solid #f59e0b">
+          <div style="color:#f59e0b;font-size:32px;font-weight:700">{data["attention"]}</div>
+          <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-top:4px;font-weight:600">Needs Attention (65-79%)</div>
+        </div>
+        <div style="background:#1a1d27;border-radius:12px;padding:18px;text-align:center;border:1px solid #2a2d3a;border-left:4px solid #ef4444">
+          <div style="color:#ef4444;font-size:32px;font-weight:700">{data["at_risk"]}</div>
+          <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-top:4px;font-weight:600">At Risk (&lt;65%)</div>
+        </div>
+        <div style="background:#1a1d27;border-radius:12px;padding:18px;text-align:center;border:1px solid #2a2d3a;border-left:4px solid #64748b">
+          <div style="color:#64748b;font-size:32px;font-weight:700">{data["zero_tracked"]}</div>
+          <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-top:4px;font-weight:600">Zero Tracked</div>
+        </div>
+      </div>
+    </div>'''
+
+    # ── Client Table with nested projects ──
+    client_rows = ''
+    for _, row in cs.iterrows():
+        client = row['Client']
+        sched = row['Scheduled']
+        tracked = row['Tracked']
+        util = row['Utilization']
+        status_label, status_color = get_status(util, sched, tracked)
+        util_str = f"{util:.1f}%" if util is not None else "—"
+        diff = tracked - sched
+        diff_str = f"{diff:+.1f}h"
+        diff_color = '#10b981' if diff >= 0 else '#ef4444'
+
+        client_rows += f'''<tr style="border-bottom:1px solid #2a2d3a;background:#1a1d27">
+          <td style="padding:14px;color:#e2e8f0;font-size:13px;font-weight:600">{client}</td>
+          <td style="padding:14px;color:#94a3b8;font-size:13px;text-align:right">{sched:.1f}</td>
+          <td style="padding:14px;color:#94a3b8;font-size:13px;text-align:right">{tracked:.1f}</td>
+          <td style="padding:14px;color:{diff_color};font-size:13px;text-align:right;font-weight:500">{diff_str}</td>
+          <td style="padding:14px;color:#e2e8f0;font-size:13px;text-align:right;font-weight:600">
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px">
+              <div style="width:60px;height:6px;background:#0f1117;border-radius:3px;overflow:hidden">
+                <div style="height:100%;width:{min(util or 0, 100):.0f}%;background:{util_color(util)};border-radius:3px"></div>
+              </div>
+              {util_str}
+            </div>
+          </td>
+          <td style="padding:14px;text-align:right">{status_badge(status_label, status_color)}</td>
+        </tr>'''
+
+        # Nested project rows
+        projects = pd_detail[pd_detail['Client'] == client].sort_values('Tracked', ascending=False)
+        for _, proj in projects.iterrows():
+            p_util = proj['Utilization']
+            p_util_str = f"{p_util:.1f}%" if p_util is not None else "—"
+            p_diff = proj['Tracked'] - proj['Scheduled']
+            p_diff_str = f"{p_diff:+.1f}h"
+            p_diff_color = '#10b981' if p_diff >= 0 else '#ef4444'
+            p_status_label, p_status_color = get_status(p_util, proj['Scheduled'], proj['Tracked'])
+
+            client_rows += f'''<tr style="border-bottom:1px solid #1e2130">
+              <td style="padding:10px 14px 10px 36px;color:#94a3b8;font-size:12px">↳ {proj["ProjectName"]}</td>
+              <td style="padding:10px 14px;color:#64748b;font-size:12px;text-align:right">{proj["Scheduled"]:.1f}</td>
+              <td style="padding:10px 14px;color:#64748b;font-size:12px;text-align:right">{proj["Tracked"]:.1f}</td>
+              <td style="padding:10px 14px;color:{p_diff_color};font-size:12px;text-align:right">{p_diff_str}</td>
+              <td style="padding:10px 14px;color:#94a3b8;font-size:12px;text-align:right">
+                <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px">
+                  <div style="width:40px;height:4px;background:#0f1117;border-radius:2px;overflow:hidden">
+                    <div style="height:100%;width:{min(p_util or 0, 100):.0f}%;background:{util_color(p_util)};border-radius:2px"></div>
+                  </div>
+                  {p_util_str}
+                </div>
+              </td>
+              <td style="padding:10px 14px;text-align:right"><span style="color:{p_status_color};font-size:10px;font-weight:600">{p_status_label}</span></td>
+            </tr>'''
+
+    # ── Top Clients Bar Chart ──
+    top_clients = cs[cs['Tracked'] > 0].head(10)
+    max_tracked = top_clients['Tracked'].max() if len(top_clients) > 0 else 1
+    bar_rows = ''
+    for _, row in top_clients.iterrows():
+        pct = (row['Tracked'] / max_tracked) * 100
+        bar_rows += f'''<div style="margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+            <span style="color:#e2e8f0;font-size:13px;font-weight:600">{row["Client"]}</span>
+            <span style="color:#94a3b8;font-size:12px">{row["Tracked"]:.1f}h</span>
+          </div>
+          <div style="height:22px;background:#0f1117;border-radius:6px;overflow:hidden">
+            <div style="height:100%;width:{pct:.1f}%;background:linear-gradient(90deg,#6366f1,#818cf8);border-radius:6px"></div>
+          </div>
+        </div>'''
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiderise Client Utilization Report — {date_range}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0f1117;color:#e2e8f0;font-family:'Inter',system-ui,sans-serif;padding:32px;min-height:100vh}}
+  .container{{max-width:1400px;margin:0 auto}}
+  table{{width:100%;border-collapse:collapse}}
+  th{{padding:10px 14px;color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;text-align:left;border-bottom:1px solid #2a2d3a}}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- HEADER -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:32px">
+    <div>
+      <div style="display:flex;align-items:center;gap:14px;margin-bottom:4px">
+        <div style="width:44px;height:44px;background:linear-gradient(135deg,#6366f1,#818cf8);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:white">CU</div>
+        <div>
+          <h1 style="font-size:28px;font-weight:700">Tiderise Client Utilization Report</h1>
+          <div style="color:#94a3b8;font-size:14px;margin-top:2px">Weekly Client Assignment Tracking — Clockify Assignments Export</div>
+        </div>
+      </div>
+    </div>
+    <div style="background:#1a1d27;border:1px solid #2a2d3a;padding:10px 18px;border-radius:10px;text-align:right">
+      <div style="color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:0.5px">Reporting</div>
+      <div style="color:#e2e8f0;font-size:14px;font-weight:600;margin-top:2px">{date_range}</div>
+      <div style="color:#64748b;font-size:11px;margin-top:2px">Generated: {gen_time}</div>
+    </div>
+  </div>
+
+  <!-- KPI CARDS -->
+  {kpi_cards}
+
+  <!-- GAUGES -->
+  {gauges}
+
+  <!-- HEALTH SUMMARY -->
+  <div style="margin-bottom:24px">
+    {health_cards}
+  </div>
+
+  <!-- CLIENT TABLE + TOP CLIENTS -->
+  <div style="display:grid;grid-template-columns:1.8fr 1fr;gap:16px;margin-bottom:24px">
+    <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+      <div style="color:#e2e8f0;font-size:16px;font-weight:700;margin-bottom:16px;text-transform:uppercase;letter-spacing:0.5px">Utilization by Client & Project</div>
+      <div style="max-height:700px;overflow-y:auto">
+      <table>
+        <thead><tr>
+          <th>Client / Project</th>
+          <th style="text-align:right">Scheduled (h)</th>
+          <th style="text-align:right">Tracked (h)</th>
+          <th style="text-align:right">Variance</th>
+          <th style="text-align:right">Utilization</th>
+          <th style="text-align:right">Status</th>
+        </tr></thead>
+        <tbody>{client_rows}</tbody>
+      </table>
+      </div>
+    </div>
+    <div style="background:#1a1d27;border-radius:16px;padding:24px;border:1px solid #2a2d3a">
+      <div style="color:#e2e8f0;font-size:16px;font-weight:700;margin-bottom:16px;text-transform:uppercase;letter-spacing:0.5px">Top Clients by Tracked Hours</div>
+      {bar_rows}
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <div style="color:#64748b;font-size:11px;text-align:center;margin-top:20px;padding:16px">
+    Tiderise Client Utilization Report · {date_range} · Generated {gen_time}<br>
+    Source: Clockify Assignments Export · Internal Tiderise MW hours excluded · Health thresholds: Healthy &ge;80%, Attention 65-79%, At Risk &lt;65%
+  </div>
+
+</div>
+</body>
+</html>'''
+    return html
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    filepath = find_latest_assignments()
+    print(f"Using: {os.path.basename(filepath)}")
+
+    df, start_date, end_date = parse_assignments(filepath)
+    data = build_report(df)
+    html = generate_html(data, start_date, end_date)
+
+    # Determine output filename
+    if start_date and end_date:
+        week_label = f"{start_date.strftime('%b %d')}-{end_date.strftime('%d %Y')}"
+    else:
+        week_label = datetime.now().strftime('%Y-%m-%d')
+
+    output_path = os.path.join(SANDBOX, f"Weekly Client Utilization {week_label}.html")
+    with open(output_path, 'w') as f:
+        f.write(html)
+
+    print(f"Report saved: {os.path.basename(output_path)}")
+    print(f"Overall utilization: {data['overall_util']:.1f}%")
+    print(f"Clients: {data['num_clients']} total — {data['healthy']} healthy, {data['attention']} attention, {data['at_risk']} at risk, {data['zero_tracked']} zero tracked")
+    return output_path
+
+if __name__ == '__main__':
+    main()
